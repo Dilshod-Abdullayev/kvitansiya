@@ -233,11 +233,14 @@ class KvitansiyaTest(unittest.TestCase):
         self.assertIn("no session transcript", K.render(rs, verbose=True))
 
     # --- tests (from the session transcript) ---
-    def transcript(self, events, path=None):
+    def transcript(self, events, path=None, start=None):
+        """events: (tool, cmd, out, is_error[, shell cwd of that call]); start: session start timestamp."""
         p = os.path.join(self.tmp.name, "t.jsonl")
         with open(p, "w") as f:
-            for i, (tool, cmd, out, err) in enumerate(events):
-                f.write(json.dumps({"type": "assistant", "message": {"content": [
+            if start:
+                f.write(json.dumps({"type": "user", "timestamp": start, "message": {"content": "go"}}) + "\n")
+            for i, (tool, cmd, out, err, *cwd) in enumerate(events):
+                f.write(json.dumps({"type": "assistant", "cwd": cwd[0] if cwd else None, "message": {"content": [
                     {"type": "tool_use", "id": f"t{i}", "name": tool, "input": {"command": cmd, "file_path": path}}]}}) + "\n")
                 f.write(json.dumps({"type": "user", "message": {"content": [
                     {"type": "tool_result", "tool_use_id": f"t{i}", "content": out, "is_error": err}]}}) + "\n")
@@ -287,6 +290,165 @@ class KvitansiyaTest(unittest.TestCase):
     def test_honest_partial_tests_not_blocked(self):
         tr = self.transcript([("Edit", "", "ok", False), ("Bash", "pytest", "3 failed, 103 passed", False)])
         self.assertEqual(self.status("Final: 103/106 tests pass, 3 are pre-existing.", tr), [("tests", "skip")])
+
+    # --- several repos in one session (Jarvis workers: cwd is not a repo, a vault auto-commits every 3 min) ---
+    def vault(self):
+        """A second repo that auto-commits and auto-pushes: its HEAD is always fresh and always on the remote."""
+        remote = os.path.join(self.tmp.name, "vault.git")
+        v = os.path.join(self.tmp.name, "vault")
+        sh(self.tmp.name, "git", "init", "-q", "--bare", "-b", "main", remote)
+        sh(self.tmp.name, "git", "clone", "-q", remote, v)
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            sh(v, "git", "config", k, val)
+        write(os.path.join(v, "Holat.md"), "x", "w")
+        sh(v, "git", "add", ".")
+        sh(v, "git", "commit", "-qm", "auto: Mac 2026-10-01 17:58")
+        sh(v, "git", "push", "-q", "-u", "origin", "main")
+        return v
+
+    def test_push_checked_in_the_repo_the_session_pushed_from(self):
+        # ish #37: the agent pushed from app (it did not land); the hook cwd is the vault, whose auto-push
+        # makes "origin/main = your commit" always true — the false push must not hide behind it
+        vault = self.vault()
+        self.commit("fix")  # committed in app, never pushed
+        tr = self.transcript([("Bash", f"cd {self.repo}; git push origin main 2>&1", "", False),
+                              ("Bash", f"cd {vault} && git status", "", False)])  # newest repo touched: the vault
+        r = K.verify("Tasdig'ingiz bilan push qilindi.", vault, tr)[0]
+        self.assertEqual(r.status, "fail", r.evidence)
+        self.assertIn("[app]", r.evidence)
+        self.assertNotIn("vault", r.evidence)
+        # no `cd` in the command: the transcript line's own cwd says where the shell was
+        tr = self.transcript([("Bash", "git push origin main", "", False, self.repo),
+                              ("Bash", "git status", "", False, vault)])
+        self.assertEqual(K.verify("Pushed to main.", vault, tr)[0].status, "fail")
+        sh(self.repo, "git", "push", "-q")
+        self.assertEqual(K.verify("Pushed to main.", vault, tr)[0].status, "ok")
+
+    def test_push_without_a_push_command_is_only_a_warning(self):
+        # nothing in the transcript pushed: the vault looking pushed is a guess, not a receipt
+        vault = self.vault()
+        tr = self.transcript([("Bash", "ls", "", False, vault)])
+        r = K.verify("Hammasi push qilindi.", vault, tr)[0]
+        self.assertEqual(r.status, "warn")
+        self.assertIn("ran no `git push`", r.evidence)
+
+    def test_push_loop_over_repos_checks_each(self):
+        # ish #9/#12: `for d in web admin; do git -C $d push` — every repo, by name
+        t = self.tmp.name
+        sh(t, "git", "clone", "-q", self.remote, "web")
+        for k, val in (("user.email", "t@t"), ("user.name", "t")):
+            sh(os.path.join(t, "web"), "git", "config", k, val)
+        self.commit("not pushed")
+        cmd = "for d in web app; do echo \"== $d\"; git -C $d push origin main 2>&1 | tail -3; done"
+        tr = self.transcript([("Bash", cmd, "== web\nEverything up-to-date\n== app\n", False, t)])
+        r = K.verify("To'rt repo push qilindi.", self.vault(), tr)[0]
+        self.assertEqual(r.status, "fail")
+        self.assertIn("[web] origin/main", r.evidence)
+        self.assertIn("[app] origin/main is at", r.evidence)
+
+    def test_push_trusts_what_it_shipped_over_a_parallel_commit(self):
+        # another session commits in the same repo after our push: HEAD is theirs, not our claim
+        old = sh(self.repo, "git", "rev-parse", "--short", "HEAD")
+        mine = self.commit("mine")
+        sh(self.repo, "git", "push", "-q")
+        out = f"To {self.remote}\n   {old}..{mine[:7]}  main -> main"
+        tr = self.transcript([("Bash", "git push origin main", out, False, self.repo)])
+        self.commit("parallel session")
+        r = K.verify("Pushed to main.", self.tmp.name, tr)[0]
+        self.assertEqual(r.status, "ok", r.evidence)
+        self.assertIn(mine[:7], r.evidence)
+        # but if this session itself committed again after its push, the claim covers that commit too
+        tr = self.transcript([("Bash", "git push origin main", out, False, self.repo),
+                              ("Bash", "git commit -qam more", "", False, self.repo)])
+        self.assertEqual(K.verify("Pushed to main.", self.tmp.name, tr)[0].status, "fail")
+
+    def test_push_ok_when_a_later_command_in_the_chain_failed(self):
+        # ish #37: `git push ...; gh run list` — the exit code is gh's, the push itself landed
+        self.commit("fix")
+        sh(self.repo, "git", "push", "-q")
+        tr = self.transcript([("Bash", f"cd {self.repo}; git push origin main 2>&1; gh run list",
+                               "Exit code 1\nEverything up-to-date\ngh: not logged in", True)])
+        self.assertEqual(K.verify("Pushed to main.", self.tmp.name, tr)[0].status, "ok")
+
+    def test_commit_checked_where_the_session_committed(self):
+        # ish #28: commit ran in app (old HEAD = nothing new); the vault's fresh auto-commit must not answer for it
+        vault = self.vault()
+        sh(self.repo, "git", "commit", "-q", "--amend", "--no-edit", "--date=2020-01-01T00:00:00")
+        os.environ["GIT_COMMITTER_DATE"] = "2020-01-01T00:00:00"
+        try:
+            sh(self.repo, "git", "commit", "-q", "--amend", "--no-edit")
+        finally:
+            del os.environ["GIT_COMMITTER_DATE"]
+        tr = self.transcript([("Bash", "git commit -qm x", "nothing to commit", True, self.repo),
+                              ("Bash", "git status", "", False, vault)], start="2026-10-01T10:00:00.000Z")
+        r = K.verify("Hammasi commit qilindi.", vault, tr)[0]
+        self.assertEqual(r.status, "fail", r.evidence)
+        self.assertIn("[app]", r.evidence)
+        # the commit the session's own `git commit` printed is named, even if HEAD moved on since
+        mine = self.commit("mine")
+        tr = self.transcript([("Bash", "git commit -m mine", f"[main {mine[:7]}] mine\n 1 file changed", False, self.repo)])
+        self.commit("parallel session")
+        r = K.verify("Commit qildim.", vault, tr)[0]
+        self.assertEqual(r.status, "ok", r.evidence)
+        self.assertIn(f"your commit {mine[:7]}", r.evidence)
+
+    def test_quoted_git_push_is_text_not_a_push(self):
+        # real case: a journal line and a sed pattern that mention `git push`
+        vault = self.vault()
+        for cmd in (f'cd {vault}; echo "- 18:02 ish #37: commit; git push origin main" >> Jurnal.md',
+                    f"cd {vault} && sed -i '' \"s|push qilinmadi|git push origin main|\" Holat.md",
+                    f"cd {vault} && git log --grep='git commit -m x; git push'"):
+            ev = {"tool": "Bash", "cmd": cmd, "out": "", "error": False}
+            self.assertEqual(K.git_writes(vault, [ev]), [], cmd)
+            tr = self.transcript([("Bash", cmd, "", False, vault)])
+            r = K.verify("Hammasi push qilindi.", vault, tr)[0]
+            self.assertEqual(r.status, "warn", (cmd, r.evidence))
+
+    def test_commit_q_or_failed_does_not_borrow_the_vaults_auto_commit(self):
+        # critic round 1 / ish #36: `git commit -q` prints no hash; a failed commit prints "nothing to commit";
+        # either way the vault's fresh `auto: Mac …` HEAD must not become "your commit"
+        vault = self.vault()
+        tr = self.transcript([("Bash", "git add -A && git commit -qm 'Holat yangilandi'", "Exit code 1\nnothing to commit, working tree clean",
+                               True, vault)], start="2026-10-01T10:00:00.000Z")
+        r = K.verify("Fayllar vault'ga commit qilindi.", vault, tr)[0]
+        self.assertEqual(r.status, "warn", r.evidence)
+        self.assertIn("nothing to commit", r.evidence)
+        tr = self.transcript([("Bash", "git add -A && git commit -q -F /tmp/msg.txt", "", False, vault)],
+                             start="2026-10-01T10:00:00.000Z")  # -q and a message file: nothing ties HEAD to us
+        r = K.verify("Fayllar vault'ga commit qilindi.", vault, tr)[0]
+        self.assertEqual((r.status, "not provably yours" in r.evidence), ("warn", True), r.evidence)
+        # -q, but the subject is in the command: that commit is ours, even under a newer auto-commit
+        write(os.path.join(vault, "Holat.md"), "y", "w")
+        sh(vault, "git", "commit", "-qam", "ish #36: Holat va Jurnal yangilandi")
+        mine = sh(vault, "git", "rev-parse", "--short=7", "HEAD")
+        write(os.path.join(vault, "Holat.md"), "z", "w")
+        sh(vault, "git", "commit", "-qam", "auto: Mac 2026-10-01 18:24")
+        tr = self.transcript([("Bash", "git add -A && git commit -q -m \"ish #36: Holat va Jurnal yangilandi\"", "", False, vault)],
+                             start="2026-10-01T10:00:00.000Z")
+        r = K.verify("Fayllar vault'ga commit qilindi.", vault, tr)[0]
+        self.assertEqual(r.status, "ok", r.evidence)
+        self.assertIn(f"your commit {mine}", r.evidence)
+
+    def test_commit_found_by_time_window(self):
+        # -q and -F: no hash, no message in the command — the only commit made while the command ran is ours
+        t = int(sh(self.repo, "git", "log", "-1", "--format=%ct")) + 600  # well apart from setUp's commit
+        write(os.path.join(self.repo, "a.txt"), "m", "a")
+        subprocess.run(["git", "commit", "-qam", "from a message file"], cwd=self.repo, check=True,
+                       env={**os.environ, "GIT_COMMITTER_DATE": f"@{t}"})
+        mine = sh(self.repo, "git", "rev-parse", "HEAD")
+        ev = {"tool": "Bash", "cmd": "git commit -q -F /tmp/m.txt", "out": "", "error": False, "cwd": self.repo, "t0": t - 1, "t1": t + 1}
+        w = K.git_writes(self.repo, [ev])
+        self.assertEqual(K.own_commit(self.repo, w, None)[0], mine[:8])
+        ev2 = {**ev, "t0": t + 100, "t1": t + 101, "_writes": {}}
+        self.assertIsNone(K.own_commit(self.repo, K.git_writes(self.repo, [ev2]), None))
+
+    def test_git_writes_parsing(self):
+        # commit messages and heredoc bodies are text, not commands; `cd` moves the shell; `-C` wins
+        t = self.tmp.name
+        cmd = (f"cd {t} && git -C app add . && git -C app commit -q -F - <<'EOF'\ncd /nowhere\ngit push\nEOF\n"
+               f"cd app; git commit -m \"line one\ngit push origin main\"")
+        ws = K.git_writes("/", [{"tool": "Bash", "cmd": cmd, "out": "", "error": False}])
+        self.assertEqual([(w["kind"], os.path.basename(w["repo"])) for w in ws], [("commit", "app"), ("commit", "app")])
 
     # --- hook protocol ---
     def hook(self, payload):

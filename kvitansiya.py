@@ -178,71 +178,226 @@ def git(cwd: str, *args: str) -> tuple[int, str]:
 CD_RE = re.compile(r"(?:^|&&|;|\|\|)\s*cd\s+(\"[^\"]+\"|'[^']+'|[^\s;&|]+)|\bgit\s+-C\s+(\"[^\"]+\"|'[^']+'|[^\s;&|]+)")
 
 
-GIT_WRITE_RE = re.compile(r"(?:^|&&|;|\|\||\n)\s*git(?:\s+-C\s+\S+)?\s+(commit|push)\b")
 EXTRA_REPOS = [os.path.expanduser(p) for p in os.environ.get("KVITANSIYA_REPOS", "").split(os.pathsep) if p]
 
 
+_TOPS: dict[str, str] = {}
+
+
+def repo_top(d: str) -> str:
+    """Git top-level containing d (or its nearest existing parent), '' if none."""
+    while d and not os.path.isdir(d) and d != os.path.dirname(d):
+        d = os.path.dirname(d)
+    if not d or d == "/":
+        return ""
+    if d not in _TOPS:
+        rc, top = git(d, "rev-parse", "--show-toplevel")
+        _TOPS[d] = top if rc == 0 else ""
+    return _TOPS[d]
+
+
 def session_repos(cwd: str, evs: list[dict], text: str = "") -> list[str]:
-    """Git top-levels the agent worked in: cwd + every `cd X` / `git -C X` in its Bash calls
-    + paths named in its message + KVITANSIYA_REPOS, newest first."""
+    """Git top-levels the agent worked in. Repos where the session itself ran `git push` / `git commit`
+    come first (newest first): a repo that only got cd'd into, named in the message, or is the hook's cwd
+    (often a vault that auto-commits every few minutes) must not outrank them. Then cwd + every `cd X` /
+    `git -C X` in its Bash calls + paths named in its message + KVITANSIYA_REPOS, newest first."""
     seen, out = set(), []
     dirs = EXTRA_REPOS + [os.path.expanduser(m) for m in re.findall(r"(?<![\w])(~?/[\w.@/-]+)", text)] + [cwd]
     for e in evs:
         if e["tool"] == "Bash":
+            base = e.get("cwd") or cwd
             for a, b in CD_RE.findall(e["cmd"] or ""):
                 d = os.path.expanduser((a or b).strip("\"'"))
-                dirs.append(d if os.path.isabs(d) else os.path.join(cwd, d))
-    for d in reversed(dirs):
-        while d and not os.path.isdir(d) and d != os.path.dirname(d):
-            d = os.path.dirname(d)
-        rc, top = git(d, "rev-parse", "--show-toplevel") if d and d != "/" else (1, "")
-        if rc == 0 and top not in seen:
+                dirs.append(d if os.path.isabs(d) else os.path.join(base, d))
+    tops = [w["repo"] for w in reversed(git_writes(cwd, evs))] + [repo_top(d) for d in reversed(dirs)]
+    for top in tops:
+        if top and top not in seen:
             seen.add(top)
             out.append(top)
+    return out
+
+
+_SEG_LEAD = r"^\s*(?:(?:do|then|else|\(|\{|!)\s*)*(?:\w+=\S*\s+)*"
+SEG_CD_RE = re.compile(_SEG_LEAD + r"cd(?:\s+([^\s;&|()]+))?\s*\)?\s*$")
+SEG_GIT_RE = re.compile(_SEG_LEAD + r"git((?:\s+(?:-C|-c)\s+\S+|\s+--?[\w-]+(?:=\S+)?)*)\s+(commit|push)\b(.*)$")
+FOR_RE = re.compile(r"\bfor\s+(\w+)\s+in\s+([^;\n]+?)\s*(?:;|\n)\s*do\b")
+QUOTED_ARG_RE = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'[^']*'")
+
+
+def _mask_quotes(cmd: str) -> tuple[str, list[str]]:
+    """Heredoc bodies go; every quoted string becomes \x00N\x00. Then `;`, `|`, newlines and `git push`
+    inside `echo "...; git push" >> Jurnal.md`, `sed "s|a|b|"` or a commit message are text, not commands."""
+    cmd = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\b", "<<_", cmd, flags=re.S)
+    saved: list[str] = []
+
+    def keep(m):
+        saved.append(m.group(0))
+        return f"\x00{len(saved) - 1}\x00"
+    return QUOTED_ARG_RE.sub(keep, cmd), saved
+
+
+def _dirs(arg: str, cur: str, loops: dict[str, list[str]]) -> list[str]:
+    """Resolve a `cd` / `-C` argument against the shell dir; `$d` from `for d in a b; do` gives one dir per value."""
+    a = arg.strip("\"'")
+    m = re.search(r"\$\{?(\w+)\}?", a)
+    if m and m.group(1) in loops:
+        return [d for v in loops[m.group(1)] for d in _dirs(a[:m.start()] + v + a[m.end():], cur, loops)]
+    a = os.path.expanduser(a.replace("$HOME", os.path.expanduser("~")))
+    if "$" in a or "`" in a:
+        return []  # unknown at rest: no guessing
+    return [os.path.normpath(a if os.path.isabs(a) else os.path.join(cur, a))]
+
+
+def _event_writes(e: dict, cwd: str) -> list[dict]:
+    """`git push` / `git commit` run by one Bash call: {kind, repo, args, ev}. The directory is the shell dir
+    of that call (the transcript line's `cwd`, else the hook cwd), moved by `cd X` before it, or `git -C X`.
+    Cached on the event: one session asks this many times."""
+    base = e.get("cwd") or cwd
+    cache = e.setdefault("_writes", {})
+    if base in cache:
+        return cache[base]
+    out: list[dict] = []
+    if e["tool"] == "Bash" and re.search(r"\bgit\b[^\n]*\b(?:commit|push)\b", e["cmd"] or ""):
+        cmd, saved = _mask_quotes(e["cmd"])
+        back = lambda x: re.sub(r"\x00(\d+)\x00", lambda m: saved[int(m.group(1))], x)  # noqa: E731
+        loops = {v: [back(x).strip("\"'") for x in vals.split()] for v, vals in FOR_RE.findall(cmd)}
+        cur = [base]
+        for seg in re.split(r"&&|\|\||[;|\n]", cmd):
+            m = SEG_CD_RE.match(seg)
+            if m:
+                cur = _dirs(back(m.group(1) or "~"), cur[0], loops) if cur else []
+                continue
+            m = SEG_GIT_RE.match(seg)
+            if not m or not cur:
+                continue
+            c = re.findall(r"-C\s+(\S+)", m.group(1))
+            for d in (_dirs(back(c[-1]), cur[0], loops) if c else cur):
+                top = repo_top(d)
+                if top:
+                    out.append({"kind": m.group(2), "repo": top, "args": back(m.group(3)).strip(), "ev": e})
+    cache[base] = out
+    return out
+
+
+def git_writes(cwd: str, evs: list[dict]) -> list[dict]:
+    """Every `git push` / `git commit` the session itself ran, in order."""
+    return [w for e in evs for w in _event_writes(e, cwd)]
+
+
+def own_repos(kind: str, cwd: str, evs: list[dict]) -> list[str]:
+    """Repos where the session ran `git <kind>` itself, newest first."""
+    out: list[str] = []
+    for w in reversed(git_writes(cwd, evs)):
+        if w["kind"] == kind and w["repo"] not in out:
+            out.append(w["repo"])
     return out
 
 
 def repo_of_last(cmd: str, cwd: str, evs: list[dict]) -> str | None:
     for e in reversed(evs):
         if e["tool"] == "Bash" and cmd in (e["cmd"] or ""):
-            rs = session_repos(cwd, [e])
+            rs = session_repos(e.get("cwd") or cwd, [e])
             return rs[0] if rs else None
     return None
 
 
-def push_repo(c: Claim, cwd: str, evs: list[dict], text: str = "") -> str | None:
-    repos = session_repos(cwd, evs, text)
-    if c.sha:
-        for r in repos:
-            if git(r, "cat-file", "-e", f"{c.sha}^{{commit}}")[0] == 0:
-                return r
-        return None
-    last = repo_of_last("git push", cwd, evs)
-    if last:
-        return last
-    top = git(cwd, "rev-parse", "--show-toplevel")
-    return top[1] if top[0] == 0 else (repos[0] if repos else None)
+def _sha_home(sha: str, repos: list[str]) -> str | None:
+    return next((r for r in repos if git(r, "cat-file", "-e", f"{sha}^{{commit}}")[0] == 0), None)
+
+
+def _combine(c: Claim, parts: list[tuple[str, Receipt]]) -> Receipt:
+    """One receipt per claim: the worst status wins; the evidence names every repo."""
+    rank = {FAIL: 3, WARN: 2, OK: 1, SKIP: 0}
+    worst = max((r.status for _, r in parts), key=rank.get)
+    ev = "; ".join(f"[{os.path.basename(repo)}] {r.evidence}" for repo, r in parts)
+    return Receipt(c, worst, ev)
+
+
+def _guessed(r: Receipt, kind: str, repo: str) -> Receipt:
+    """The transcript shows no `git <kind>` of this session: whatever the repo we fell back to says
+    (a vault auto-commits and auto-pushes every few minutes, so it always looks fresh) is not evidence."""
+    if r.status == SKIP:
+        return r
+    return Receipt(r.claim, WARN, f"this session ran no `git {kind}` I can see — checked {os.path.basename(repo)} "
+                                  f"as a guess: {r.evidence}")
 
 
 def check_push(c: Claim, cwd: str, evs: list[dict] | None = None, text: str = "") -> Receipt:
     evs = evs or []
-    repo = push_repo(c, cwd, evs, text)
-    if not repo:
-        if c.sha:
-            ran = any(e["tool"] == "Bash" and GIT_WRITE_RE.search(e["cmd"] or "") for e in evs)
+    writes = [w for w in git_writes(cwd, evs) if w["kind"] == "push"]
+    if c.sha:
+        repo = _sha_home(c.sha, session_repos(cwd, evs, text))
+        if not repo:
+            ran = bool(git_writes(cwd, evs))
             return Receipt(c, FAIL if ran else WARN, f"commit {c.sha} is not in any local repo I can see"
                            + (" — although this session ran git here: the hash looks invented" if ran else " — cannot confirm the push"))
+        last = next((w for w in reversed(writes) if w["repo"] == repo), None)
+        r = _push_in(c, repo, last, None, bool(evs))
+        return r if last or not evs else _guessed(r, "push", repo)
+    if writes:  # every repo this session pushed from, not whichever repo happens to be newest
+        at = {id(e): i for i, e in enumerate(evs)}
+        commits = [w for w in git_writes(cwd, evs) if w["kind"] == "commit"]
+        parts = []
+        for r in own_repos("push", cwd, evs):
+            here = [w for w in writes if w["repo"] == r]
+            # what the push itself reported (`5f372f8..78c2a85  main -> main`): a parallel session may have
+            # committed here since, so HEAD is not ours — unless we committed again after our last push
+            mine_here = [w for w in commits if w["repo"] == r]
+            later = any(at[id(w["ev"])] > at[id(here[-1]["ev"])] for w in mine_here)
+            shipped = None if later else _own_sha(r, here, PUSHED_RE)
+            mine = own_commit(r, mine_here, None) if mine_here else None
+            if mine and (later or not shipped):  # what we committed must be there, whoever committed after us
+                shipped = (mine[0], "")
+            parts.append((r, _push_in(c, r, here[-1], shipped, True)))
+        return _combine(c, parts)
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    repos = session_repos(cwd, evs, text)
+    repo = top[1] if top[0] == 0 else (repos[0] if repos else None)
+    if not repo:
         return Receipt(c, SKIP, "not a git repo")
-    cwd = repo
-    last_push = next((e for e in reversed(evs) if e["tool"] == "Bash" and "git push" in (e["cmd"] or "")), None)
-    if last_push and (last_push["error"] or re.search(r"\[rejected\]|failed to push|error: ", last_push["out"])):
-        m = re.search(r"(\[rejected\].*|failed to push.*|error: .*)", last_push["out"])
-        return Receipt(c, FAIL, f"the last `git push` in this session failed: {(m.group(0) if m else last_push['out'][:100]).strip()[:120]}")
+    r = _push_in(c, repo, None, None, bool(evs))
+    return _guessed(r, "push", repo) if evs else r
+
+
+PUSHED_RE = re.compile(r"\b([0-9a-f]{7,40})\.{2,3}([0-9a-f]{7,40})\s+(\S+)\s+->\s+(\S+)")
+COMMITTED_RE = re.compile(r"\[[^\]\s]+(?: \(root-commit\))? ([0-9a-f]{7,40})\] ")
+
+
+def _own_sha(repo: str, writes: list[dict], rx: re.Pattern) -> tuple[str, str] | None:
+    """The newest commit the session's own push/commit output names that really lives in this repo:
+    (sha, branch). Outputs of a `for` loop mix several repos; the hash decides which one it was."""
+    for w in reversed(writes):
+        for m in reversed(list(rx.finditer(w["ev"]["out"] or ""))):
+            sha = m.group(2) if rx is PUSHED_RE else m.group(1)
+            if git(repo, "cat-file", "-e", f"{sha}^{{commit}}")[0] == 0:
+                return sha, (re.sub(r"^refs/heads/", "", m.group(4)) if rx is PUSHED_RE else "")
+    return None
+
+
+def _push_in(c: Claim, cwd: str, w: dict | None, shipped: tuple[str, str] | None = None, transcript: bool = False) -> Receipt:
+    """Is the claimed (or the pushed) commit on the remote branch of this repo?
+    `w` is the session's own last `git push` here: its output and its refspec;
+    `shipped` is (sha, branch) that push reported."""
+    if w:
+        # the push's own words; a bare exit code may belong to any later command in the chain, and
+        # `for d in a b; do git -C $d push` prints for several repos — then the remote below decides
+        m = re.search(r"(\[rejected\].*|failed to push.*|error: .*)", w["ev"]["out"])
+        if m and len(git_writes(cwd, [w["ev"]])) == 1:
+            return Receipt(c, FAIL, f"the last `git push` in this session failed: {m.group(0).strip()[:120]}")
     _, head = git(cwd, "rev-parse", "HEAD")
     _, cur = git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-    branch = c.target or cur
+    pos = [a for a in re.split(r"\s+", re.split(r"\s*(?:\d?>|<|\|)", (w or {}).get("args", ""))[0]) if a and not a.startswith("-")]
+    src = dst = ""
+    if len(pos) >= 2 and not re.search(r"[$`]", pos[1]):  # `git push origin 78c2a85:refs/heads/main` ships 78c2a85, not HEAD
+        src, colon, dst = pos[1].lstrip("+").partition(":")
+        dst = re.sub(r"^refs/heads/", "", dst or src)
+        rc, src = git(cwd, "rev-parse", "--verify", "--quiet", f"{src}^{{commit}}") if colon and src else (1, "")
+        src = src[:12] if rc == 0 else ""
+    branch = c.target or (dst if dst and dst != "HEAD" else "") or (shipped[1] if shipped else "") or cur
     rc, up = git(cwd, "rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}")
     remote = up.split("/")[0] if rc == 0 else "origin"
+    if pos and git(cwd, "remote", "get-url", pos[0])[0] == 0:
+        remote = pos[0]
     rc, out = git(cwd, "ls-remote", remote, f"refs/heads/{branch}")
     if rc:
         first = next((l.strip() for l in out.splitlines() if l.strip()), "")
@@ -250,13 +405,15 @@ def check_push(c: Claim, cwd: str, evs: list[dict] | None = None, text: str = ""
     if not out:
         return Receipt(c, FAIL, f"branch '{branch}' does not exist on {remote}")
     remote_sha = out.split()[0]
-    want = c.sha or head
+    want = c.sha or src or (shipped[0] if shipped else "") or head
+    # with a transcript, HEAD alone does not show the commit is ours (a vault auto-commits on its own)
+    who = "HEAD" if transcript and not (c.sha or src or shipped) else "your commit"
     rc, full = git(cwd, "rev-parse", "--verify", "--quiet", f"{want}^{{commit}}")
     want_full = full if rc == 0 else want
     if remote_sha.startswith(want) or remote_sha == want_full:
         dirty = _dirty(cwd)
         note = f" (but {dirty} tracked file(s) still uncommitted)" if dirty else ""
-        return Receipt(c, WARN if dirty else OK, f"{remote}/{branch} = {remote_sha[:7]} = your commit{note}")
+        return Receipt(c, WARN if dirty else OK, f"{remote}/{branch} = {remote_sha[:7]} = {who}{note}")
     if git(cwd, "cat-file", "-e", f"{remote_sha}^{{commit}}")[0] and not os.environ.get("KVITANSIYA_NO_FETCH"):
         git(cwd, "fetch", "--quiet", remote, branch)
     if git(cwd, "merge-base", "--is-ancestor", want_full, remote_sha)[0] == 0:
@@ -269,6 +426,11 @@ def check_push(c: Claim, cwd: str, evs: list[dict] | None = None, text: str = ""
 def _dirty(cwd: str) -> int:
     rc, out = git(cwd, "status", "--porcelain", "--untracked-files=no")
     return len([l for l in out.splitlines() if l.strip()]) if rc == 0 else 0
+
+
+def _epoch(ts) -> int | None:
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", ts or "")
+    return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")) if m else None
 
 
 def session_start(transcript: str) -> int | None:
@@ -284,33 +446,81 @@ def session_start(transcript: str) -> int | None:
 
 
 def check_commit(c: Claim, cwd: str, evs: list[dict] | None = None, text: str = "", transcript: str | None = None) -> Receipt:
-    repos = session_repos(cwd, evs or [], text)
+    evs = evs or []
+    repos = session_repos(cwd, evs, text)
     if not repos:
         return Receipt(c, SKIP, "not a git repo")
     if c.sha:
-        home = next((r for r in repos if git(r, "cat-file", "-e", f"{c.sha}^{{commit}}")[0] == 0), None)
+        home = _sha_home(c.sha, repos)
         if not home:
-            ran = any(e["tool"] == "Bash" and GIT_WRITE_RE.search(e["cmd"] or "") for e in evs or [])
+            ran = bool(git_writes(cwd, evs))
             return Receipt(c, FAIL if ran else WARN, f"commit {c.sha} is not in any repo I can see ({', '.join(os.path.basename(r) for r in repos)})"
                            + (" although this session ran git there: the hash looks invented" if ran else ""))
-        cwd = home
-        _, subj = git(cwd, "log", "-1", "--format=%s", c.sha)
+        _, subj = git(home, "log", "-1", "--format=%s", c.sha)
         return Receipt(c, OK, f"{c.sha[:7]} exists: “{subj[:60]}”")
-    if not c.sha:
-        cwd = repo_of_last("git commit", cwd, evs or []) or repos[0]
-    _, ts = git(cwd, "log", "-1", "--format=%ct|%h|%s")
+    start = session_start(transcript) if transcript else None
+    commits = [w for w in git_writes(cwd, evs) if w["kind"] == "commit"]
+    if commits:  # every repo this session committed in, not whichever repo happens to be newest
+        return _combine(c, [(r, _commit_in(c, r, start, [w for w in commits if w["repo"] == r]))
+                            for r in own_repos("commit", cwd, evs)])
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    repo = top[1] if top[0] == 0 else repos[0]
+    r = _commit_in(c, repo, start)
+    return _guessed(r, "commit", repo) if evs else r
+
+
+NO_COMMIT_RE = re.compile(r"nothing to commit|nothing added to commit|no changes added to commit|"
+                          r"Aborting commit|fatal: |error: pathspec|Please tell me who you are")
+
+
+def own_commit(repo: str, writes: list[dict], start: int | None) -> tuple[str, str] | None:
+    """The newest commit in `repo` that provably came from this session's own `git commit`: (sha, how).
+    1) the hash `git commit` printed (`[main 5e1d2c3] fix`); 2) a commit whose subject is in the command
+    (`-m "…"`, heredoc), which survives `-q`; 3) the only commit made while that command ran (transcript
+    timestamps). A neighbour that commits on its own (a vault's `auto: Mac …`) matches none of these."""
+    printed = _own_sha(repo, writes, COMMITTED_RE)
+    if printed:
+        return printed[0], "printed by git commit"
+    since = min([w["ev"]["t0"] for w in writes if w["ev"].get("t0")] + ([start] if start else []), default=None)
+    rc, log_ = git(repo, "log", "-n", "200", "--format=%H|%ct|%s", *([f"--since=@{since - 120}"] if since else []))
+    log_rows = [l.split("|", 2) for l in log_.splitlines() if l.count("|") >= 2] if rc == 0 else []
+    for w in reversed(writes):
+        e = w["ev"]
+        for sha, _, subj in log_rows:
+            if len(subj.strip()) >= 8 and subj.strip() in e["cmd"]:
+                return sha[:8], "its message is in this session's git commit"
+        if e.get("t0"):
+            t1 = e.get("t1") or e["t0"] + 60
+            during = [sha for sha, ct, _ in log_rows if e["t0"] - 2 <= int(ct) <= t1 + 2]
+            if len(during) == 1:
+                return during[0][:8], "made while this session's git commit ran"
+    return None
+
+
+def _commit_in(c: Claim, cwd: str, start: int | None, writes: list[dict] | None = None) -> Receipt:
+    """`writes`: this session's `git commit` calls in this repo (None: no transcript, HEAD is all we have).
+    HEAD may be a later commit by someone else (a parallel session, a vault auto-commit), so it only
+    counts when one of them provably made it."""
+    mine = own_commit(cwd, writes, start) if writes else None
+    _, ts = git(cwd, "log", "-1", "--format=%ct|%h|%s", *([mine[0]] if mine else []))
     try:
         t, h, subj = ts.split("|", 2)
         age = (time.time() - int(t)) / 60
     except ValueError:
         return Receipt(c, FAIL, "no commits in this repo")
-    dirty = _dirty(cwd)
-    start = session_start(transcript) if transcript else None
     if (start and int(t) < start - 60) or (not start and age > 180):
         return Receipt(c, FAIL, f"last commit {h} is {age/60:.1f} h old, older than this session — nothing was committed")
+    if writes and not mine:
+        failed = next((m.group(0) for w in reversed(writes) for m in [NO_COMMIT_RE.search(w["ev"]["out"] or "")] if m), "")
+        why = f"this session's `git commit` here said “{failed}”" if failed else \
+            "nothing shows it came from this session's `git commit` (no hash printed, message not in the command)"
+        return Receipt(c, WARN, f"HEAD {h} “{subj[:50]}” is not provably yours: {why}")
+    who = "your commit" if mine else "HEAD"
+    when = f"{age:.0f} min ago" + (f", {mine[1]}" if mine else "")
+    dirty = _dirty(cwd)
     if dirty:
-        return Receipt(c, WARN, f"HEAD {h} “{subj[:50]}” ({age:.0f} min ago), but {dirty} tracked file(s) are still uncommitted")
-    return Receipt(c, OK, f"HEAD {h} “{subj[:50]}” ({age:.0f} min ago), tree clean")
+        return Receipt(c, WARN, f"{who} {h} “{subj[:50]}” ({when}), but {dirty} tracked file(s) are still uncommitted")
+    return Receipt(c, OK, f"{who} {h} “{subj[:50]}” ({when}), tree clean")
 
 
 def fetch(url: str) -> tuple[int, str, str]:
@@ -395,7 +605,7 @@ FAIL_OUT_RE = re.compile(r"(\b[1-9]\d* (?:failed|failing|errors?)\b|\bFAILED\b|\
 
 
 def session_events(transcript: str) -> list[dict]:
-    """Tool calls of the session in order: {tool, cmd, error, out}."""
+    """Tool calls of the session in order: {tool, cmd, path, error, out, cwd, t0, t1 (call / result time)}."""
     calls: dict[str, dict] = {}
     order: list[dict] = []
     try:
@@ -417,7 +627,8 @@ def session_events(transcript: str) -> list[dict]:
                 if b.get("type") == "tool_use":
                     inp = b.get("input") or {}
                     ev = {"tool": b.get("name"), "cmd": inp.get("command", ""), "path": inp.get("file_path") or inp.get("notebook_path"),
-                          "error": None, "out": ""}
+                          "error": None, "out": "", "cwd": d.get("cwd"),  # the shell dir this call started in
+                          "t0": _epoch(d.get("timestamp")), "t1": None}
                     calls[b.get("id")] = ev
                     order.append(ev)
                 elif b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
@@ -426,6 +637,7 @@ def session_events(transcript: str) -> list[dict]:
                     if isinstance(out, list):
                         out = " ".join(x.get("text", "") for x in out if isinstance(x, dict))
                     ev["out"] = str(out or "")
+                    ev["t1"] = _epoch(d.get("timestamp"))
                     ev["error"] = b.get("is_error") in (True, "True", "true") or ev["out"].startswith("Exit code")
     return order
 
