@@ -245,7 +245,8 @@ def check_push(c: Claim, cwd: str, evs: list[dict] | None = None, text: str = ""
     remote = up.split("/")[0] if rc == 0 else "origin"
     rc, out = git(cwd, "ls-remote", remote, f"refs/heads/{branch}")
     if rc:
-        return Receipt(c, WARN, f"could not reach remote '{remote}': {out[:120]}")
+        first = next((l.strip() for l in out.splitlines() if l.strip()), "")
+        return Receipt(c, WARN, f"could not reach remote '{remote}': {first[:160]}")
     if not out:
         return Receipt(c, FAIL, f"branch '{branch}' does not exist on {remote}")
     remote_sha = out.split()[0]
@@ -327,7 +328,8 @@ def fetch(url: str) -> tuple[int, str, str]:
 def check_deploy(c: Claim, cwd: str) -> Receipt:
     code, body, final = fetch(c.target)
     if code == 0:
-        return Receipt(c, FAIL, f"{c.target} is unreachable ({body})")
+        # DNS failure, timeout, no network: we could not look, which is not a contradiction
+        return Receipt(c, WARN, f"could not reach {c.target} ({body}) — not verified")
     if code >= 400:
         return Receipt(c, FAIL, f"{c.target} returns HTTP {code}")
     missing = [e for e in c.expect if e.lower() not in body.lower()]
@@ -357,14 +359,25 @@ def check_file(c: Claim, cwd: str, evs: list[dict] | None = None, transcript: st
         return Receipt(c, SKIP, f"{c.target}: not a real absolute path (a fragment of a longer one?)")
     written = [e["path"] for e in (evs or []) if e.get("path")]
     if not os.path.isabs(p):
-        hit = next((w for w in reversed(written) if w.endswith("/" + c.target.lstrip("./"))), None)
-        p = hit or os.path.join(cwd, p)
-        if not hit and not os.path.exists(p) and not transcript and os.path.isdir(os.path.dirname(p)) and os.path.dirname(c.target):
-            # no transcript to say where it was written, but its folder is right here: worth a look, not an accusation
-            return Receipt(c, WARN, f"{c.target} is not in {os.path.dirname(p)}/ (no transcript to locate it elsewhere)")
-        if not hit and not os.path.exists(p):
-            # relative to some other folder we can't see: don't accuse without evidence
-            return Receipt(c, SKIP, f"{c.target}: location unknown")
+        rel = re.sub(r"^(?:\./)+", "", c.target)
+        hit = next((w for w in reversed(written) if w.endswith("/" + rel)), None)
+        if not hit:  # cwd first, then every repo the agent cd'd into
+            roots = [cwd] + [r for r in session_repos(cwd, evs or []) if r != cwd]
+            hit = next((os.path.join(r, rel) for r in roots if os.path.exists(os.path.join(r, rel))), None)
+        p = hit or os.path.join(cwd, rel)
+        if not hit:
+            folder = os.path.dirname(p)
+            if not (os.path.dirname(rel) and os.path.isdir(folder)):
+                # relative to some other folder we can't see: don't accuse without evidence
+                return Receipt(c, SKIP, f"{c.target}: location unknown")
+            name = os.path.basename(rel)
+            shell = any(name in (e["cmd"] or "") for e in (evs or []) if e["tool"] == "Bash")
+            if transcript and os.path.isfile(transcript) and not shell:
+                # its folder is right here, the file is not, and nothing in this session wrote it
+                return Receipt(c, FAIL, f"{c.target} does not exist in {folder}/, and no Write/Edit or shell command "
+                                        f"in this session created it")
+            why = "a shell command in this session mentions it — maybe written elsewhere" if shell else "no transcript to locate it elsewhere"
+            return Receipt(c, WARN, f"{c.target} is not in {folder}/ ({why})")
     if not os.path.exists(p):
         return Receipt(c, FAIL, f"{c.target} does not exist" + (" (the agent wrote it earlier — it is gone now)" if p in written else ""))
     if os.path.isfile(p) and os.path.getsize(p) == 0:
@@ -482,13 +495,15 @@ def verify(text: str, cwd: str, transcript: str | None = None) -> list[Receipt]:
 # ---------------------------------------------------------------- output ----
 
 
-def render(receipts: list[Receipt]) -> str:
+def render(receipts: list[Receipt], verbose: bool = False) -> str:
     shown = [r for r in receipts if r.status != SKIP]
     bad = sum(r.status == FAIL for r in shown)
-    head = f"KVITANSIYA — {len(shown)} claim(s) checked, {bad} false"
+    skipped = len(receipts) - len(shown)
+    head = f"KVITANSIYA — {len(shown)} claim(s) checked, {bad} false" + (f", {skipped} skipped" if skipped else "")
     lines = [head, "─" * len(head)]
-    for r in shown:
-        lines.append(f"{ICON[r.status]} {r.claim.kind:<6} {r.evidence}")
+    for r in receipts:
+        if r.status != SKIP or verbose:
+            lines.append(f"{ICON[r.status]} {r.claim.kind:<6} {r.evidence}")
     return "\n".join(lines)
 
 
@@ -625,7 +640,7 @@ def main(argv: list[str]) -> int:
             print(json.dumps([{**asdict(r.claim), "status": r.status, "evidence": r.evidence} for r in receipts],
                              ensure_ascii=False, indent=2))
         else:
-            print(render(receipts) if receipts else "No verifiable claims found.")
+            print(render(receipts, verbose=True) if receipts else "No verifiable claims found.")
         return 1 if any(r.status == FAIL for r in receipts) else 0
     print(__doc__)
     return 2

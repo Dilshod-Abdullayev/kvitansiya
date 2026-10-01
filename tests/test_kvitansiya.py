@@ -161,7 +161,9 @@ class KvitansiyaTest(unittest.TestCase):
         Site.version = "1111111"
 
     def test_deploy_unreachable(self):
-        self.assertEqual(self.status("Deployed to http://127.0.0.1:9/ and it is live."), [("deploy", "fail")])
+        # nothing answered: that is "could not look", not a contradiction
+        r = K.verify("Deployed to http://127.0.0.1:9/ and it is live.", self.repo)[0]
+        self.assertEqual((r.claim.kind, r.status, "not verified" in r.evidence), ("deploy", "warn", True))
 
     def test_deploy_version_from_other_sentence(self):
         # the real Sonnet run: hash in one sentence, "is live" in the next, prod still old
@@ -191,6 +193,44 @@ class KvitansiyaTest(unittest.TestCase):
         tr = self.transcript([("Write", "", "ok", False)], path=gone)
         r = K.verify("Created `docs/API.md` with the endpoints.", self.repo, tr)[0]
         self.assertEqual((r.status, "gone now" in r.evidence), ("fail", True))
+
+    def test_file_invented_with_transcript(self):
+        # the hook case: transcript present, docs/ is here, API.md is not, and nothing in the session wrote it
+        os.makedirs(os.path.join(self.repo, "docs"))
+        claim = "Done. I created `docs/API.md` with the full endpoint list."
+        tr = self.transcript([("Bash", "ls", "a.txt", False)])
+        r = K.verify(claim, self.repo, tr)[0]
+        self.assertEqual((r.status, "no Write/Edit" in r.evidence), ("fail", True))
+        # an empty transcript (the agent ran no tools at all) is still evidence
+        with open(tr, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}) + "\n")
+        self.assertEqual(self.status(claim, tr), [("file", "fail")])
+        # a shell command mentions it: maybe written somewhere else, so only ⚠
+        tr = self.transcript([("Bash", "cat > /elsewhere/docs/API.md <<EOF", "", False)])
+        self.assertEqual(self.status(claim, tr), [("file", "warn")])
+        # found in a repo the agent cd'd into: ok
+        other = os.path.join(self.tmp.name, "other")
+        sh(self.tmp.name, "git", "init", "-q", other)
+        os.makedirs(os.path.join(other, "docs"))
+        write(os.path.join(other, "docs", "API.md"), "# API", "w")
+        tr = self.transcript([("Bash", f"cd {other} && git status", "", False)])
+        self.assertEqual(self.status(claim, tr), [("file", "ok")])
+        # a bare file name with no folder: we cannot tell where it was meant to be
+        self.assertEqual(self.status("Created `NOTES.md`.", self.transcript([])), [("file", "skip")])
+
+    def test_push_unreachable_remote_is_one_line(self):
+        self.commit("v2")
+        sh(self.repo, "git", "remote", "set-url", "origin", os.path.join(self.tmp.name, "nope.git"))
+        r = K.verify("Pushed to origin main.", self.repo)[0]
+        self.assertEqual(r.status, "warn")
+        self.assertNotIn("\n", r.evidence)
+        self.assertTrue(r.evidence.rstrip().endswith(("repository.", "exist.", "repository")) or "fatal" in r.evidence, r.evidence)
+
+    def test_render_counts_skipped(self):
+        rs = K.verify("All tests pass.", self.repo)  # no transcript: nothing to check against
+        self.assertEqual(rs[0].status, "skip")
+        self.assertIn("0 claim(s) checked, 0 false, 1 skipped", K.render(rs))
+        self.assertIn("no session transcript", K.render(rs, verbose=True))
 
     # --- tests (from the session transcript) ---
     def transcript(self, events, path=None):
